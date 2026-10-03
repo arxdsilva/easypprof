@@ -64,7 +64,14 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			http.Error(rec, msg, status)
 		}
 
-		if s.stopped.Load() {
+		// Checked before auth, so a switched-off server doesn't double as a
+		// token oracle.
+		switch s.state.Load() {
+		case stateDisabled:
+			rec.Header().Set("Retry-After", "60")
+			deny(http.StatusServiceUnavailable, "profiling disabled")
+			return
+		case stateStopped:
 			deny(http.StatusServiceUnavailable, "debug server stopped")
 			return
 		}

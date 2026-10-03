@@ -41,6 +41,12 @@
 //		log.Fatal(err)
 //	}
 //	defer srv.Shutdown(context.Background())
+//
+// Either way, profiling can be switched off and on at runtime, for example
+// from an admin endpoint, without unmounting or closing anything:
+//
+//	srv.Disable() // endpoints answer 503, runtime profiling rates restored
+//	srv.Enable()
 package easypprof
 
 import (
@@ -69,6 +75,14 @@ const (
 
 // PathPrefix is where the pprof endpoints are served.
 const PathPrefix = "/debug/pprof/"
+
+// Values of Server.state, read lock-free by the guard. The zero value is
+// stateServing.
+const (
+	stateServing int32 = iota
+	stateDisabled
+	stateStopped
+)
 
 // minTokenLength guards against weak or accidentally empty tokens, such as an
 // unset environment variable.
@@ -156,12 +170,15 @@ type Server struct {
 	fr      *flightRecorder
 	frState snapshotState
 
-	// stopped makes the handler answer 503 after Shutdown, since a route
-	// mounted on someone else's mux can't be removed.
-	stopped atomic.Bool
+	// state is what the guard answers: serving, disabled (503) or stopped
+	// (503 after Shutdown, since a route mounted on someone else's mux can't
+	// be removed).
+	state atomic.Int32
 
 	mu        sync.Mutex
-	active    bool
+	attached  bool // serving via Start or Handler; cleared by Shutdown
+	disabled  bool // switched off with Disable
+	runtimeOn bool // block/mutex rates and flight recorder applied
 	srv       *http.Server
 	ln        net.Listener
 	prevMutex int
@@ -248,7 +265,7 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active {
+	if s.attached {
 		return errors.New("easypprof: server already started")
 	}
 
@@ -257,10 +274,14 @@ func (s *Server) Start() error {
 		return fmt.Errorf("easypprof: listen %s: %w", s.cfg.Addr, err)
 	}
 
-	if err := s.activateLocked(); err != nil {
-		ln.Close()
-		return err
+	if !s.disabled {
+		if err := s.activateLocked(); err != nil {
+			ln.Close()
+			return err
+		}
 	}
+	s.attached = true
+	s.setStateLocked()
 
 	s.ln = ln
 	s.srv = &http.Server{
@@ -285,6 +306,7 @@ func (s *Server) Start() error {
 	s.log.Info("debug server listening",
 		"addr", ln.Addr().String(),
 		"auth", s.authMode(),
+		"enabled", !s.disabled,
 		"block_profile_rate", s.cfg.BlockProfileRate,
 		"mutex_profile_fraction", s.cfg.MutexProfileFraction,
 		"flight_recorder", s.fr != nil,
@@ -307,16 +329,21 @@ func (s *Server) Handler() (http.Handler, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active {
+	if s.attached {
 		return nil, errors.New("easypprof: server already started")
 	}
-	if err := s.activateLocked(); err != nil {
-		return nil, err
+	if !s.disabled {
+		if err := s.activateLocked(); err != nil {
+			return nil, err
+		}
 	}
+	s.attached = true
+	s.setStateLocked()
 
 	s.log.Info("debug handler mounted",
 		"path", PathPrefix,
 		"auth", s.authMode(),
+		"enabled", !s.disabled,
 		"block_profile_rate", s.cfg.BlockProfileRate,
 		"mutex_profile_fraction", s.cfg.MutexProfileFraction,
 		"flight_recorder", s.fr != nil,
@@ -350,8 +377,7 @@ func (s *Server) activateLocked() error {
 		s.prevMutex = runtime.SetMutexProfileFraction(s.cfg.MutexProfileFraction)
 		s.setMutex = true
 	}
-	s.active = true
-	s.stopped.Store(false)
+	s.runtimeOn = true
 	return nil
 }
 
@@ -368,7 +394,71 @@ func (s *Server) deactivateLocked() {
 		runtime.SetMutexProfileFraction(s.prevMutex)
 		s.setMutex = false
 	}
-	s.active = false
+	s.runtimeOn = false
+}
+
+// setStateLocked derives the guard's state from disabled. Only call it while
+// attached. s.mu must be held.
+func (s *Server) setStateLocked() {
+	if s.disabled {
+		s.state.Store(stateDisabled)
+	} else {
+		s.state.Store(stateServing)
+	}
+}
+
+// Enable turns profiling back on after Disable: it re-applies the block and
+// mutex rates, restarts the flight recorder (with an empty buffer) and lets
+// requests through. It is idempotent. Before Start or Mount it only records
+// the intent. After Shutdown it records the intent, but the handler keeps
+// answering 503 until the server is started or mounted again.
+func (s *Server) Enable() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.disabled {
+		return nil
+	}
+	s.disabled = false
+	if !s.attached {
+		return nil
+	}
+	if err := s.activateLocked(); err != nil {
+		s.disabled = true
+		return err
+	}
+	s.setStateLocked()
+	s.log.Info("profiling enabled")
+	return nil
+}
+
+// Disable turns profiling off without closing the listener or unmounting the
+// handler: endpoints answer 503 Service Unavailable, the runtime profiling
+// rates are restored and the flight recorder is stopped. Profiles already in
+// progress run to completion. It is idempotent. Called before Start or Mount,
+// the server starts switched off.
+func (s *Server) Disable() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.disabled {
+		return
+	}
+	s.disabled = true
+	if !s.attached {
+		return
+	}
+	if s.runtimeOn {
+		s.deactivateLocked()
+	}
+	s.setStateLocked()
+	s.log.Info("profiling disabled")
+}
+
+// Enabled reports whether profiling is switched on. It reflects the last
+// Enable or Disable call, whether or not the server is running.
+func (s *Server) Enabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.disabled
 }
 
 // Addr returns the address the server is listening on, or "" before Start.
@@ -387,14 +477,14 @@ func (s *Server) Addr() string {
 // mounted mode there is no listener to stop; the handler starts answering 503.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
-	if !s.active {
+	if !s.attached {
 		s.mu.Unlock()
 		return nil
 	}
+	s.state.Store(stateStopped)
 	srv := s.srv
 	s.srv, s.ln = nil, nil
 	s.mu.Unlock()
-	s.stopped.Store(true)
 
 	var err error
 	if srv != nil {
@@ -404,7 +494,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	s.deactivateLocked()
+	if s.runtimeOn {
+		s.deactivateLocked()
+	}
+	s.attached = false
 	s.mu.Unlock()
 
 	s.log.Info("debug server stopped")

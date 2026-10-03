@@ -24,7 +24,13 @@ func newFlightRecorder(cfg FlightRecorderConfig) *flightRecorder {
 	}
 }
 
-func (f *flightRecorder) start() error { return f.fr.Start() }
+func (f *flightRecorder) start() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fr.Start()
+}
+
+func (f *flightRecorder) enabled() bool { return f.fr.Enabled() }
 
 func (f *flightRecorder) stop() {
 	f.mu.Lock()

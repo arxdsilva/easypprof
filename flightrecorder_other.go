@@ -13,4 +13,5 @@ type flightRecorder struct{}
 func newFlightRecorder(FlightRecorderConfig) *flightRecorder { return &flightRecorder{} }
 func (*flightRecorder) start() error                         { return ErrFlightRecorderUnsupported }
 func (*flightRecorder) stop()                                {}
+func (*flightRecorder) enabled() bool                        { return false }
 func (*flightRecorder) writeTo(io.Writer) (int64, error)     { return 0, ErrFlightRecorderUnsupported }

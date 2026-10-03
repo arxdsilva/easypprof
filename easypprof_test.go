@@ -536,3 +536,195 @@ func TestMountExtendsWriteDeadline(t *testing.T) {
 		t.Fatalf("truncated CPU profile: %v", err)
 	}
 }
+
+// getStatus does an authenticated GET against base+path and returns the status.
+func getStatus(t *testing.T, base, path, tok string) int {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, base+path, nil)
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+func mutexFraction() int { return runtime.SetMutexProfileFraction(-1) }
+
+func TestDisableEnableMounted(t *testing.T) {
+	prev := mutexFraction()
+	var buf bytes.Buffer
+	s := newTestServer(t, Config{
+		Tokens: map[string]string{"oncall": testToken},
+		Logger: slog.New(slog.NewJSONHandler(&buf, nil)),
+	})
+	mux := http.NewServeMux()
+	if err := s.Mount(mux); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	if got := getStatus(t, ts.URL, PathPrefix+"heap", testToken); got != http.StatusOK {
+		t.Fatalf("enabled heap status = %d", got)
+	}
+	if got := mutexFraction(); got != DefaultMutexProfileFraction {
+		t.Fatalf("mutex fraction = %d, want %d", got, DefaultMutexProfileFraction)
+	}
+
+	// Off: endpoints answer 503 even to a valid token, runtime is restored.
+	s.Disable()
+	s.Disable()
+	if s.Enabled() {
+		t.Fatal("Enabled() = true after Disable")
+	}
+	if got := getStatus(t, ts.URL, PathPrefix+"heap", testToken); got != http.StatusServiceUnavailable {
+		t.Fatalf("disabled heap status = %d, want 503", got)
+	}
+	if got := mutexFraction(); got != prev {
+		t.Fatalf("mutex fraction while disabled = %d, want %d", got, prev)
+	}
+	if !strings.Contains(buf.String(), `"reason":"profiling disabled"`) {
+		t.Errorf("no audit reason for disabled request:\n%s", buf.String())
+	}
+	if n := strings.Count(buf.String(), `"msg":"profiling disabled"`); n != 1 {
+		t.Errorf("got %d 'profiling disabled' lifecycle lines, want 1", n)
+	}
+
+	// Back on: same mux, same route, no re-registration.
+	for i := 0; i < 2; i++ {
+		if err := s.Enable(); err != nil {
+			t.Fatalf("Enable: %v", err)
+		}
+	}
+	if !s.Enabled() {
+		t.Fatal("Enabled() = false after Enable")
+	}
+	if got := getStatus(t, ts.URL, PathPrefix+"heap", testToken); got != http.StatusOK {
+		t.Fatalf("re-enabled heap status = %d", got)
+	}
+	if got := mutexFraction(); got != DefaultMutexProfileFraction {
+		t.Fatalf("mutex fraction after Enable = %d, want %d", got, DefaultMutexProfileFraction)
+	}
+	if n := strings.Count(buf.String(), `"msg":"profiling enabled"`); n != 1 {
+		t.Errorf("got %d 'profiling enabled' lifecycle lines, want 1", n)
+	}
+
+	s.Shutdown(context.Background())
+	if got := mutexFraction(); got != prev {
+		t.Fatalf("mutex fraction after Shutdown = %d, want %d", got, prev)
+	}
+}
+
+func TestDisableBeforeMount(t *testing.T) {
+	prev := mutexFraction()
+	s := newTestServer(t, Config{Tokens: map[string]string{"oncall": testToken}})
+	s.Disable()
+	mux := http.NewServeMux()
+	if err := s.Mount(mux); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Mounted switched off: the runtime is not touched at all.
+	if got := mutexFraction(); got != prev {
+		t.Fatalf("mutex fraction = %d, want untouched %d", got, prev)
+	}
+	if got := getStatus(t, ts.URL, PathPrefix+"heap", testToken); got != http.StatusServiceUnavailable {
+		t.Fatalf("heap status = %d, want 503", got)
+	}
+
+	if err := s.Enable(); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if got := getStatus(t, ts.URL, PathPrefix+"heap", testToken); got != http.StatusOK {
+		t.Fatalf("heap status after Enable = %d", got)
+	}
+}
+
+func TestDisableStandalone(t *testing.T) {
+	s := newTestServer(t, Config{
+		Addr:   "127.0.0.1:0",
+		Tokens: map[string]string{"oncall": testToken},
+	})
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	addr := s.Addr()
+	base := "http://" + addr
+
+	// Disable keeps the port open so Enable needs no rebind.
+	s.Disable()
+	if got := getStatus(t, base, PathPrefix+"heap", testToken); got != http.StatusServiceUnavailable {
+		t.Fatalf("disabled heap status = %d, want 503", got)
+	}
+	if s.Addr() != addr {
+		t.Fatalf("Addr changed after Disable: %q → %q", addr, s.Addr())
+	}
+
+	if err := s.Enable(); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if got := getStatus(t, base, PathPrefix+"heap", testToken); got != http.StatusOK {
+		t.Fatalf("re-enabled heap status = %d", got)
+	}
+}
+
+func TestEnableAfterShutdown(t *testing.T) {
+	prev := mutexFraction()
+	var buf bytes.Buffer
+	s := newTestServer(t, Config{
+		Tokens: map[string]string{"oncall": testToken},
+		Logger: slog.New(slog.NewJSONHandler(&buf, nil)),
+	})
+	h, err := s.Handler()
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	s.Shutdown(context.Background())
+
+	// Enable on a detached server only records intent; the route stays inert.
+	if err := s.Enable(); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if got := mutexFraction(); got != prev {
+		t.Fatalf("Enable after Shutdown touched the runtime: mutex fraction = %d, want %d", got, prev)
+	}
+	req := httptest.NewRequest(http.MethodGet, PathPrefix+"heap", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(buf.String(), `"reason":"debug server stopped"`) {
+		t.Errorf("want reason 'debug server stopped':\n%s", buf.String())
+	}
+}
+
+func TestUnauthenticatedProbeWhileDisabled(t *testing.T) {
+	s := newTestServer(t, Config{Tokens: map[string]string{"oncall": testToken}})
+	h, err := s.Handler()
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	s.Disable()
+
+	// The disabled check runs before auth, so a probe can't test tokens.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, PathPrefix+"heap", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After on disabled response")
+	}
+}

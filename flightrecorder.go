@@ -21,6 +21,11 @@ var (
 	// Config.FlightRecorder was not set.
 	ErrFlightRecorderDisabled = errors.New("easypprof: flight recorder is not enabled")
 
+	// ErrFlightRecorderStopped is returned by Snapshot methods when the
+	// flight recorder is configured but not running: before Start or Mount,
+	// while the server is disabled, or after Shutdown.
+	ErrFlightRecorderStopped = errors.New("easypprof: flight recorder is not running")
+
 	// ErrSnapshotThrottled is returned by Snapshot when the previous snapshot
 	// was taken less than FlightRecorderConfig.MinInterval ago.
 	ErrSnapshotThrottled = errors.New("easypprof: snapshot throttled")
@@ -83,6 +88,11 @@ func (s *Server) Snapshot(reason string) (string, error) {
 	if s.fr == nil {
 		return "", ErrFlightRecorderDisabled
 	}
+	// Checked before the throttle, so attempts while stopped don't use up the
+	// MinInterval slot.
+	if !s.fr.enabled() {
+		return "", ErrFlightRecorderStopped
+	}
 	cfg := s.cfg.FlightRecorder
 	if cfg.Dir == "" {
 		return "", ErrNoSnapshotDir
@@ -123,6 +133,9 @@ func (s *Server) Snapshot(reason string) (string, error) {
 func (s *Server) SnapshotTo(w io.Writer) (int64, error) {
 	if s.fr == nil {
 		return 0, ErrFlightRecorderDisabled
+	}
+	if !s.fr.enabled() {
+		return 0, ErrFlightRecorderStopped
 	}
 	return s.fr.writeTo(w)
 }

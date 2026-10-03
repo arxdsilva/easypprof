@@ -98,6 +98,52 @@ Things that differ from the standalone server:
 
 `Start` and `Mount` are mutually exclusive on the same `Server`.
 
+## Turning it on and off at runtime
+
+`Disable()` switches profiling off without unmounting the route or closing the port:
+
+- the endpoints answer `503 Service Unavailable` (before auth, so a probe can't test tokens), and each request still gets an audit line with `reason=profiling disabled`
+- the block and mutex profiling rates are restored, and the flight recorder is stopped and its buffer dropped
+- profiles already in progress run to completion
+
+`Enable()` turns it all back on. The flight recorder starts again with an empty buffer. Both calls are idempotent and safe from any goroutine. Call `Disable()` before `Mount`/`Start` to start switched off.
+
+Toggle it from an admin route that your own auth already protects. Don't expose this route unauthenticated:
+
+```go
+admin.HandleFunc("POST /admin/pprof/{state}", func(w http.ResponseWriter, r *http.Request) {
+    switch r.PathValue("state") {
+    case "on":
+        if err := dbg.Enable(); err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+    case "off":
+        dbg.Disable()
+    default:
+        http.NotFound(w, r)
+    }
+})
+```
+
+Or flip it with a signal (`kill -USR1 <pid>`):
+
+```go
+sig := make(chan os.Signal, 1)
+signal.Notify(sig, syscall.SIGUSR1)
+go func() {
+    for range sig {
+        if dbg.Enabled() {
+            dbg.Disable()
+        } else if err := dbg.Enable(); err != nil {
+            log.Printf("enable pprof: %v", err)
+        }
+    }
+}()
+```
+
+While profiling is off, `Snapshot` and `SnapshotTo` return `ErrFlightRecorderStopped`, and those attempts don't count against `MinInterval`.
+
 ## Kubernetes
 
 Keep the default `127.0.0.1:6060`. `kubectl port-forward` connects inside the pod's network namespace, so loopback is reachable through it and nothing else can reach it:

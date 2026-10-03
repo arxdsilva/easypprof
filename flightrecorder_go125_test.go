@@ -67,3 +67,49 @@ func TestFlightRecorder(t *testing.T) {
 		t.Fatalf("flightrecorder status = %d", resp.StatusCode)
 	}
 }
+
+func TestFlightRecorderDisableEnable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "traces")
+	s := newTestServer(t, Config{
+		Addr:           "127.0.0.1:0",
+		FlightRecorder: &FlightRecorderConfig{Dir: dir, MinInterval: time.Hour},
+	})
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Shutdown(context.Background())
+
+	s.Disable()
+	if _, err := s.Snapshot("x"); !errors.Is(err, ErrFlightRecorderStopped) {
+		t.Fatalf("Snapshot while disabled: err = %v, want ErrFlightRecorderStopped", err)
+	}
+	var buf bytes.Buffer
+	if _, err := s.SnapshotTo(&buf); !errors.Is(err, ErrFlightRecorderStopped) {
+		t.Fatalf("SnapshotTo while disabled: err = %v, want ErrFlightRecorderStopped", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("snapshot files written while disabled: %v", entries)
+	}
+
+	// The recorder restarts, and the failed attempt above did not use up the
+	// hour-long throttle slot.
+	if err := s.Enable(); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		go func() { time.Sleep(time.Millisecond) }()
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := s.Snapshot("x"); err != nil {
+		t.Fatalf("Snapshot after Enable: %v", err)
+	}
+}
+
+func TestSnapshotBeforeStart(t *testing.T) {
+	s := newTestServer(t, Config{
+		FlightRecorder: &FlightRecorderConfig{Dir: t.TempDir(), MinInterval: time.Hour},
+	})
+	if _, err := s.Snapshot("x"); !errors.Is(err, ErrFlightRecorderStopped) {
+		t.Fatalf("Snapshot before Start: err = %v, want ErrFlightRecorderStopped", err)
+	}
+}
