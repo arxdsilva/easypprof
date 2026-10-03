@@ -381,3 +381,158 @@ func TestSanitizeReason(t *testing.T) {
 		t.Errorf("long reason not truncated: len %d", len(got))
 	}
 }
+
+func TestMountRequiresAuth(t *testing.T) {
+	s := newTestServer(t, Config{})
+	if err := s.Mount(http.NewServeMux()); err == nil {
+		t.Fatal("Mount without auth succeeded")
+	}
+	if _, err := s.Handler(); err == nil {
+		t.Fatal("Handler without auth succeeded")
+	}
+
+	s = newTestServer(t, Config{AllowUnauthenticated: true})
+	if err := s.Mount(http.NewServeMux()); err != nil {
+		t.Fatalf("Mount with AllowUnauthenticated: %v", err)
+	}
+	s.Shutdown(context.Background())
+}
+
+func TestMount(t *testing.T) {
+	var buf bytes.Buffer
+	s := newTestServer(t, Config{
+		Tokens: map[string]string{"oncall": testToken},
+		Logger: slog.New(slog.NewJSONHandler(&buf, nil)),
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/hello", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "hi") })
+	if err := s.Mount(mux); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	get := func(path, tok string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp
+	}
+
+	// The host's own routes are untouched by the mount.
+	if resp := get("/api/hello", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("app route status = %d", resp.StatusCode)
+	}
+	// The guard still applies on the shared mux: no token, no profile.
+	if resp := get(PathPrefix+"heap", ""); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("heap without token status = %d, want 401", resp.StatusCode)
+	}
+	if resp := get(PathPrefix+"heap", testToken); resp.StatusCode != http.StatusOK {
+		t.Fatalf("heap with token status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(buf.String(), `"msg":"pprof request"`) {
+		t.Errorf("no audit log line:\n%s", buf.String())
+	}
+}
+
+func TestMountRuntimeRatesAndShutdown(t *testing.T) {
+	prevMutex := runtime.SetMutexProfileFraction(-1)
+
+	s := newTestServer(t, Config{Tokens: map[string]string{"oncall": testToken}})
+	h, err := s.Handler()
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	if got := runtime.SetMutexProfileFraction(-1); got != DefaultMutexProfileFraction {
+		t.Fatalf("mutex fraction = %d, want %d", got, DefaultMutexProfileFraction)
+	}
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if got := runtime.SetMutexProfileFraction(prevMutex); got != prevMutex {
+		t.Fatalf("mutex fraction not restored: got %d, want %d", got, prevMutex)
+	}
+
+	// The route can't be removed from the host mux, so it must go inert.
+	req := httptest.NewRequest(http.MethodGet, PathPrefix+"heap", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status after Shutdown = %d, want 503", rec.Code)
+	}
+}
+
+func TestMountTwiceAndStartAfterMount(t *testing.T) {
+	s := newTestServer(t, Config{
+		Addr:   "127.0.0.1:0",
+		Tokens: map[string]string{"oncall": testToken},
+	})
+	if err := s.Mount(http.NewServeMux()); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	if err := s.Mount(http.NewServeMux()); err == nil {
+		t.Fatal("second Mount succeeded")
+	}
+	if err := s.Start(); err == nil {
+		t.Fatal("Start after Mount succeeded")
+	}
+}
+
+func TestStartThenMount(t *testing.T) {
+	s := newTestServer(t, Config{
+		Addr:   "127.0.0.1:0",
+		Tokens: map[string]string{"oncall": testToken},
+	})
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	if _, err := s.Handler(); err == nil {
+		t.Fatal("Handler after Start succeeded")
+	}
+}
+
+func TestMountExtendsWriteDeadline(t *testing.T) {
+	s := newTestServer(t, Config{Tokens: map[string]string{"oncall": testToken}})
+	mux := http.NewServeMux()
+	if err := s.Mount(mux); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	// A host server whose WriteTimeout is shorter than the profile.
+	ts := httptest.NewUnstartedServer(mux)
+	ts.Config.WriteTimeout = 500 * time.Millisecond
+	ts.Start()
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+PathPrefix+"profile?seconds=1", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET profile cut off by host WriteTimeout: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	zr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatalf("CPU profile is not gzip: %v", err)
+	}
+	if _, err := io.ReadAll(zr); err != nil {
+		t.Fatalf("truncated CPU profile: %v", err)
+	}
+}

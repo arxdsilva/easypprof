@@ -21,7 +21,7 @@
 //   - on Go 1.25+, runs a runtime/trace flight recorder you can snapshot when
 //     something goes wrong.
 //
-// Typical use:
+// Typical use, on a dedicated listener:
 //
 //	srv, err := easypprof.New(easypprof.Config{
 //		Tokens: map[string]string{"oncall": os.Getenv("PPROF_TOKEN")},
@@ -30,6 +30,14 @@
 //		log.Fatal(err)
 //	}
 //	if err := srv.Start(); err != nil {
+//		log.Fatal(err)
+//	}
+//	defer srv.Shutdown(context.Background())
+//
+// Or embedded in an existing server's mux, with no extra port. This mode
+// always requires Tokens or Authorizer:
+//
+//	if err := srv.Mount(mux); err != nil {
 //		log.Fatal(err)
 //	}
 //	defer srv.Shutdown(context.Background())
@@ -46,6 +54,7 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -147,7 +156,12 @@ type Server struct {
 	fr      *flightRecorder
 	frState snapshotState
 
+	// stopped makes the handler answer 503 after Shutdown, since a route
+	// mounted on someone else's mux can't be removed.
+	stopped atomic.Bool
+
 	mu        sync.Mutex
+	active    bool
 	srv       *http.Server
 	ln        net.Listener
 	prevMutex int
@@ -234,7 +248,7 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.srv != nil {
+	if s.active {
 		return errors.New("easypprof: server already started")
 	}
 
@@ -243,20 +257,9 @@ func (s *Server) Start() error {
 		return fmt.Errorf("easypprof: listen %s: %w", s.cfg.Addr, err)
 	}
 
-	if s.fr != nil {
-		if err := s.fr.start(); err != nil {
-			ln.Close()
-			return fmt.Errorf("easypprof: start flight recorder: %w", err)
-		}
-	}
-
-	if s.cfg.BlockProfileRate > 0 {
-		runtime.SetBlockProfileRate(s.cfg.BlockProfileRate)
-		s.setBlock = true
-	}
-	if s.cfg.MutexProfileFraction > 0 {
-		s.prevMutex = runtime.SetMutexProfileFraction(s.cfg.MutexProfileFraction)
-		s.setMutex = true
+	if err := s.activateLocked(); err != nil {
+		ln.Close()
+		return err
 	}
 
 	s.ln = ln
@@ -289,6 +292,85 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// Handler applies the runtime settings Start would (block and mutex rates,
+// flight recorder) and returns the guarded pprof handler, for serving on an
+// existing server instead of a dedicated listener. Serve it at PathPrefix; with
+// a ServeMux, use Mount.
+//
+// The host server's address is unknown here, so Handler requires Tokens or
+// Authorizer unless AllowUnauthenticated is set. Call Shutdown on the way out
+// to restore the runtime; the handler then answers 503 Service Unavailable.
+func (s *Server) Handler() (http.Handler, error) {
+	if len(s.tokens) == 0 && s.cfg.Authorizer == nil && !s.cfg.AllowUnauthenticated {
+		return nil, errors.New("easypprof: refusing to mount on a shared server without Tokens or Authorizer (set AllowUnauthenticated to override)")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return nil, errors.New("easypprof: server already started")
+	}
+	if err := s.activateLocked(); err != nil {
+		return nil, err
+	}
+
+	s.log.Info("debug handler mounted",
+		"path", PathPrefix,
+		"auth", s.authMode(),
+		"block_profile_rate", s.cfg.BlockProfileRate,
+		"mutex_profile_fraction", s.cfg.MutexProfileFraction,
+		"flight_recorder", s.fr != nil,
+	)
+	return s.handler, nil
+}
+
+// Mount registers the pprof endpoints on mux at PathPrefix. See Handler.
+func (s *Server) Mount(mux *http.ServeMux) error {
+	h, err := s.Handler()
+	if err != nil {
+		return err
+	}
+	mux.Handle(PathPrefix, h)
+	return nil
+}
+
+// activateLocked starts the flight recorder and sets the runtime profiling
+// rates. s.mu must be held.
+func (s *Server) activateLocked() error {
+	if s.fr != nil {
+		if err := s.fr.start(); err != nil {
+			return fmt.Errorf("easypprof: start flight recorder: %w", err)
+		}
+	}
+	if s.cfg.BlockProfileRate > 0 {
+		runtime.SetBlockProfileRate(s.cfg.BlockProfileRate)
+		s.setBlock = true
+	}
+	if s.cfg.MutexProfileFraction > 0 {
+		s.prevMutex = runtime.SetMutexProfileFraction(s.cfg.MutexProfileFraction)
+		s.setMutex = true
+	}
+	s.active = true
+	s.stopped.Store(false)
+	return nil
+}
+
+// deactivateLocked undoes activateLocked. s.mu must be held.
+func (s *Server) deactivateLocked() {
+	if s.fr != nil {
+		s.fr.stop()
+	}
+	if s.setBlock {
+		runtime.SetBlockProfileRate(0)
+		s.setBlock = false
+	}
+	if s.setMutex {
+		runtime.SetMutexProfileFraction(s.prevMutex)
+		s.setMutex = false
+	}
+	s.active = false
+}
+
 // Addr returns the address the server is listening on, or "" before Start.
 // Useful when Config.Addr uses port 0.
 func (s *Server) Addr() string {
@@ -301,33 +383,28 @@ func (s *Server) Addr() string {
 }
 
 // Shutdown stops the server, waiting for in-flight profiles until ctx is done,
-// then stops the flight recorder and restores the runtime profiling rates.
+// then stops the flight recorder and restores the runtime profiling rates. In
+// mounted mode there is no listener to stop; the handler starts answering 503.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return nil
+	}
 	srv := s.srv
 	s.srv, s.ln = nil, nil
 	s.mu.Unlock()
-	if srv == nil {
-		return nil
+	s.stopped.Store(true)
+
+	var err error
+	if srv != nil {
+		if err = srv.Shutdown(ctx); err != nil {
+			srv.Close()
+		}
 	}
 
-	err := srv.Shutdown(ctx)
-	if err != nil {
-		srv.Close()
-	}
-
-	if s.fr != nil {
-		s.fr.stop()
-	}
 	s.mu.Lock()
-	if s.setBlock {
-		runtime.SetBlockProfileRate(0)
-		s.setBlock = false
-	}
-	if s.setMutex {
-		runtime.SetMutexProfileFraction(s.prevMutex)
-		s.setMutex = false
-	}
+	s.deactivateLocked()
 	s.mu.Unlock()
 
 	s.log.Info("debug server stopped")

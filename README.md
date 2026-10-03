@@ -62,6 +62,42 @@ curl -sH "Authorization: Bearer $PPROF_TOKEN" -o block.pb.gz localhost:6060/debu
 go tool pprof -http=:7070 "http://oncall:$PPROF_TOKEN@localhost:6060/debug/pprof/heap"
 ```
 
+## Embed in your existing server
+
+If you'd rather not open another port, mount the endpoints on the mux your API already serves. You keep the same guard: tokens, CIDR allowlist, duration cap, concurrency limit and audit log.
+
+```go
+dbg, err := easypprof.New(easypprof.Config{
+    Tokens: map[string]string{"oncall": os.Getenv("PPROF_TOKEN")},
+})
+if err != nil {
+    log.Fatal(err)
+}
+if err := dbg.Mount(mux); err != nil { // registers /debug/pprof/
+    log.Fatal(err)
+}
+defer dbg.Shutdown(context.Background())
+```
+
+For other routers, `Handler()` returns the `http.Handler`. Serve it at `/debug/pprof/`:
+
+```go
+h, err := dbg.Handler()
+if err != nil {
+    log.Fatal(err)
+}
+r.Handle("/debug/pprof/*", h) // chi
+```
+
+Things that differ from the standalone server:
+
+- **Auth is mandatory.** Your API port is not loopback, so `Mount` and `Handler` refuse to run without `Tokens` or an `Authorizer`. Set `AllowUnauthenticated` only if something in front already authenticates callers.
+- **Your server's `WriteTimeout` is extended** for `profile`, `trace` and `flightrecorder` responses only, up to `MaxProfileDuration + 30s`, so long profiles aren't cut off.
+- **Behind a load balancer or proxy**, `AllowedCIDRs` sees the proxy's address, because `X-Forwarded-For` is never trusted. Rely on tokens.
+- **`Shutdown`** restores the runtime profiling rates and stops the flight recorder. A `ServeMux` can't unregister a route, so after `Shutdown` the endpoints answer `503`.
+
+`Start` and `Mount` are mutually exclusive on the same `Server`.
+
 ## Kubernetes
 
 Keep the default `127.0.0.1:6060`. `kubectl port-forward` connects inside the pod's network namespace, so loopback is reachable through it and nothing else can reach it:

@@ -64,6 +64,11 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			http.Error(rec, msg, status)
 		}
 
+		if s.stopped.Load() {
+			deny(http.StatusServiceUnavailable, "debug server stopped")
+			return
+		}
+
 		if !methodAllowed(r) {
 			rec.Header().Set("Allow", "GET, HEAD")
 			deny(http.StatusMethodNotAllowed, "method not allowed")
@@ -105,8 +110,25 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			}
 		}
 
+		if holdsOpen(r.URL.Path) {
+			// When mounted on a host server, its WriteTimeout may be shorter
+			// than the profile. Extend the deadline for this response only;
+			// errors (e.g. ErrNotSupported) leave the host's deadline in place.
+			_ = http.NewResponseController(rec).SetWriteDeadline(time.Now().Add(s.cfg.MaxProfileDuration + 30*time.Second))
+		}
+
 		next.ServeHTTP(rec, r)
 	})
+}
+
+// holdsOpen reports whether path is an endpoint that keeps the response open
+// for up to MaxProfileDuration.
+func holdsOpen(path string) bool {
+	switch strings.TrimPrefix(path, PathPrefix) {
+	case "profile", "trace", "flightrecorder":
+		return true
+	}
+	return false
 }
 
 func methodAllowed(r *http.Request) bool {
